@@ -19,6 +19,14 @@ class AudioSeparation:
                 "audio": ("AUDIO",),
             },
             "optional": {
+                "use_local_model": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "label_on": "Use local model",
+                        "tooltip": "切换：优先从本地 ComfyUI models 目录加载模型（models/audio-separation/hdemucs_high_musdb_plus.pt）。关闭则使用 bundle（可能会从网络下载）。",
+                    },
+                ),
                 "chunk_fade_shape": (
                     [
                         "linear",
@@ -57,6 +65,7 @@ class AudioSeparation:
     def main(
         self,
         audio: AUDIO,
+        use_local_model: bool = True,
         chunk_fade_shape: str = "linear",
         chunk_length: float = 10.0,
         chunk_overlap: float = 0.1,
@@ -68,8 +77,65 @@ class AudioSeparation:
         self.input_sample_rate_: int = audio["sample_rate"]
 
         bundle = HDEMUCS_HIGH_MUSDB_PLUS
-        model: torch.nn.Module = bundle.get_model().to(device)
         self.model_sample_rate = bundle.sample_rate
+
+        # Fixed local path: <COMFY_MODELS_DIR>/audio-separation/hdemucs_high_musdb_plus.pt
+        def _find_local_models_dir():
+            try:
+                get_models = getattr(comfy.model_management, "get_models_path", None)
+                if callable(get_models):
+                    path = get_models()
+                    if path:
+                        return path
+            except Exception:
+                pass
+
+            candidates = [
+                os.path.join(os.getcwd(), "models"),
+                os.path.join(os.path.dirname(__file__), "..", "models"),
+            ]
+            for c in candidates:
+                c = os.path.abspath(c)
+                if os.path.isdir(c):
+                    return c
+            return None
+
+        import os
+        import pathlib
+
+        model = None
+        if use_local_model:
+            models_dir = _find_local_models_dir()
+            if models_dir is None:
+                raise FileNotFoundError(
+                    "未找到 ComfyUI 的 models 目录。请在项目根或 ComfyUI 配置中创建一个 models 文件夹并放入本地模型。"
+                )
+
+            local_subdir = os.path.join(models_dir, "audio-separation")
+            local_filename = "hdemucs_high_musdb_plus.pt"
+            local_path = os.path.join(local_subdir, local_filename)
+
+            if not os.path.exists(local_path):
+                raise FileNotFoundError(
+                    f"本地模型未找到: {local_path}\n请在该目录创建 'audio-separation' 文件夹并把已保存的模型文件命名为 '{local_filename}'。"
+                )
+
+            loaded = torch.load(local_path, map_location=device)
+            if isinstance(loaded, torch.nn.Module):
+                model = loaded.to(device)
+            elif isinstance(loaded, dict):
+                # Try to load into the bundle architecture (best-effort)
+                try:
+                    arch = bundle.get_model()
+                    arch.load_state_dict(loaded)
+                    model = arch.to(device)
+                except Exception:
+                    raise RuntimeError(
+                        "检测到本地文件看起来是 state_dict，但无法将其载入本地架构。\n"
+                        "请保存整个 Module（torch.save(model)）到指定文件，或关闭 'Use local model' 由 bundle 处理。"
+                    )
+        else:
+            model = bundle.get_model().to(device)
 
         waveform = ensure_stereo(waveform)
 
